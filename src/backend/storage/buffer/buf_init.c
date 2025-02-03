@@ -131,6 +131,8 @@ InitBufferPool(void)
 			 * management of this list is done by freelist.c.
 			 */
 			buf->freeNext = i + 1;
+			buf->mruPrevious = MRUPREVIOUS_NOT_IN_LIST;
+			buf->mruNext = MRUNEXT_NOT_IN_LIST;
 
 			LWLockInitialize(BufferDescriptorGetContentLock(buf),
 							 LWTRANCHE_BUFFER_CONTENT);

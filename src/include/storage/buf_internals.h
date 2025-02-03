@@ -252,6 +252,8 @@ typedef struct BufferDesc
 
 	int			wait_backend_pgprocno;	/* backend of pin-count waiter */
 	int			freeNext;		/* link in freelist chain */
+	int			mruPrevious;    /* previous link in mrulist chain */
+	int			mruNext;		/* next link in mrulist chain */
 	LWLock		content_lock;	/* to lock access to buffer contents */
 } BufferDesc;
 
@@ -353,6 +355,20 @@ BufferDescriptorGetContentLock(const BufferDesc *bdesc)
 #define FREENEXT_NOT_IN_LIST	(-2)
 
 /*
+ * The mruNext field is either the index of the next freelist entry,
+ * or one of these special values:
+ */
+#define MRUNEXT_END_OF_LIST	(-1)
+#define MRUNEXT_NOT_IN_LIST	(-2)
+
+/*
+ * The mruPrevious field is either the index of the previous freelist entry,
+ * or one of these special values:
+ */
+#define MRUPREVIOUS_START_OF_LIST	(-1)
+#define MRUPREVIOUS_NOT_IN_LIST		(-2)
+
+/*
  * Functions for acquiring/releasing a shared buffer header's spinlock.  Do
  * not apply these to local buffers!
  */
@@ -433,6 +449,8 @@ extern void StrategyNotifyBgWriter(int bgwprocno);
 extern Size StrategyShmemSize(void);
 extern void StrategyInitialize(bool init);
 extern bool have_free_buffer(void);
+
+extern void setNewMruBuffer(BufferDesc *buf);
 
 /* buf_table.c */
 extern Size BufTableShmemSize(int size);

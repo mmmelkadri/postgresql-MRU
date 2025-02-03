@@ -23,7 +23,6 @@
 
 #define INT_ACCESS_ONCE(var)	((int)(*((volatile int *)&(var))))
 
-
 /*
  * The shared freelist control information.
  */
@@ -41,6 +40,7 @@ typedef struct
 
 	int			firstFreeBuffer;	/* Head of list of unused buffers */
 	int			lastFreeBuffer; /* Tail of list of unused buffers */
+	int			mruBuffer;      /* Head of list of most recently used buffers */
 
 	/*
 	 * NOTE: lastFreeBuffer is undefined when firstFreeBuffer is -1 (that is,
@@ -99,71 +99,6 @@ static void AddBufferToRing(BufferAccessStrategy strategy,
 							BufferDesc *buf);
 
 /*
- * ClockSweepTick - Helper routine for StrategyGetBuffer()
- *
- * Move the clock hand one buffer ahead of its current position and return the
- * id of the buffer now under the hand.
- */
-static inline uint32
-ClockSweepTick(void)
-{
-	uint32		victim;
-
-	/*
-	 * Atomically move hand ahead one buffer - if there's several processes
-	 * doing this, this can lead to buffers being returned slightly out of
-	 * apparent order.
-	 */
-	victim =
-		pg_atomic_fetch_add_u32(&StrategyControl->nextVictimBuffer, 1);
-
-	if (victim >= NBuffers)
-	{
-		uint32		originalVictim = victim;
-
-		/* always wrap what we look up in BufferDescriptors */
-		victim = victim % NBuffers;
-
-		/*
-		 * If we're the one that just caused a wraparound, force
-		 * completePasses to be incremented while holding the spinlock. We
-		 * need the spinlock so StrategySyncStart() can return a consistent
-		 * value consisting of nextVictimBuffer and completePasses.
-		 */
-		if (victim == 0)
-		{
-			uint32		expected;
-			uint32		wrapped;
-			bool		success = false;
-
-			expected = originalVictim + 1;
-
-			while (!success)
-			{
-				/*
-				 * Acquire the spinlock while increasing completePasses. That
-				 * allows other readers to read nextVictimBuffer and
-				 * completePasses in a consistent manner which is required for
-				 * StrategySyncStart().  In theory delaying the increment
-				 * could lead to an overflow of nextVictimBuffers, but that's
-				 * highly unlikely and wouldn't be particularly harmful.
-				 */
-				SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
-
-				wrapped = expected % NBuffers;
-
-				success = pg_atomic_compare_exchange_u32(&StrategyControl->nextVictimBuffer,
-														 &expected, wrapped);
-				if (success)
-					StrategyControl->completePasses++;
-				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
-			}
-		}
-	}
-	return victim;
-}
-
-/*
  * have_free_buffer -- a lockless check to see if there is a free buffer in
  *					   buffer pool.
  *
@@ -178,6 +113,111 @@ have_free_buffer(void)
 		return true;
 	else
 		return false;
+}
+
+/*
+ * Deletes a node in the MRU list.
+ * Assumes access to the recent list is already locked.
+ */
+void
+MRUListDelete(BufferDesc *buf)
+{
+	/*
+	 * Remove buf from mrulist. If buf is the head of mrulist, then set
+	 * next_buf (if it exists) to the new head. If there is no next_buf,
+	 * and buf is the current head, then mrulist is now empty, so mruBuffer
+	 * is set to MRUNEXT_END_OF_LIST.
+	 */
+
+	/* If buf is not in MRU list, this function should never be called. */
+	Assert(buf->mruPrevious != MRUPREVIOUS_NOT_IN_LIST);
+	Assert(buf->mruNext != MRUNEXT_NOT_IN_LIST);
+
+	BufferDesc *previous_buf, *next_buf;
+
+	if (buf->mruPrevious == MRUPREVIOUS_START_OF_LIST)
+	{
+		if (buf->mruNext != MRUNEXT_END_OF_LIST)
+		{
+			next_buf = GetBufferDescriptor(buf->mruNext);
+			next_buf->mruPrevious = MRUPREVIOUS_START_OF_LIST;
+			StrategyControl->mruBuffer = next_buf->buf_id;
+		}
+		else
+		{
+			StrategyControl->mruBuffer = MRUNEXT_END_OF_LIST;
+		}
+	}
+	else
+	{
+		BufferDesc *previous_buf = GetBufferDescriptor(buf->mruPrevious);
+		if (buf->mruNext != MRUNEXT_END_OF_LIST)
+		{
+			next_buf = GetBufferDescriptor(buf->mruNext);
+			previous_buf->mruNext = next_buf->buf_id;
+			next_buf->mruPrevious = previous_buf->buf_id;
+		}
+		else
+		{
+			previous_buf->mruNext = MRUNEXT_END_OF_LIST;
+		}
+	}
+
+	buf->mruPrevious = MRUPREVIOUS_NOT_IN_LIST;
+	buf->mruNext = MRUNEXT_NOT_IN_LIST;
+}
+
+/*
+ * setNewMruBuffer
+ *
+ * Sets buf as the new head of mrulist.
+ * If buf is already in mrulist, buf is removed cleanly from the list
+ * before being added as the head.
+ */
+void
+setNewMruBuffer(BufferDesc *buf)
+{
+	SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+
+	if (buf->buf_id == StrategyControl->mruBuffer)
+	{
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+		return;
+	}
+	
+	/*
+	 * If buf is already in mrulist, then it is removed.
+	 */
+	if (buf->mruNext != MRUNEXT_NOT_IN_LIST)
+	{
+		BufferDesc *previous_buf = GetBufferDescriptor(buf->mruPrevious);
+		if (buf->mruNext != MRUNEXT_END_OF_LIST)
+		{
+			BufferDesc *next_buf = GetBufferDescriptor(buf->mruNext);
+			previous_buf->mruNext = next_buf->buf_id;
+			next_buf->mruPrevious = previous_buf->buf_id;
+		}
+		else
+		{
+			previous_buf->mruNext = MRUNEXT_END_OF_LIST;
+		}
+	}
+
+	if (StrategyControl->mruBuffer != MRUNEXT_END_OF_LIST)
+	{
+		buf->mruNext = StrategyControl->mruBuffer;
+		BufferDesc *next_buf = GetBufferDescriptor(buf->mruNext);
+		next_buf->mruPrevious = buf->buf_id;
+	}
+	else
+	{
+		buf->mruNext = MRUNEXT_END_OF_LIST;
+	}
+
+	StrategyControl->mruBuffer = buf->buf_id;
+	buf->mruPrevious = MRUPREVIOUS_START_OF_LIST;
+
+	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 }
 
 /*
@@ -200,21 +240,10 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 	int			trycounter;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
 
-	*from_ring = false;
-
 	/*
-	 * If given a strategy object, see whether it can select a buffer. We
-	 * assume strategy objects don't need buffer_strategy_lock.
+	 * The MRU implementation should not have a non-NULL strategy.
 	 */
-	if (strategy != NULL)
-	{
-		buf = GetBufferFromRing(strategy, buf_state);
-		if (buf != NULL)
-		{
-			*from_ring = true;
-			return buf;
-		}
-	}
+	Assert(strategy == NULL);
 
 	/*
 	 * If asked, we need to waken the bgwriter. Since we don't want to rely on
@@ -292,68 +321,64 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 
 			/*
-			 * If the buffer is pinned or has a nonzero usage_count, we cannot
-			 * use it; discard it and retry.  (This can only happen if VACUUM
-			 * put a valid buffer in the freelist and then someone else used
-			 * it before we got to it.  It's probably impossible altogether as
-			 * of 8.3, but we'd better check anyway.)
+			 * If the buffer is pinned, we cannot use it; discard it and retry.
+			 * (This can only happen if VACUUM put a valid buffer in the freelist
+			 * and then someone else used it before we got to it.  It's probably
+			 * impossible altogether as of 8.3, but we'd better check anyway.)
 			 */
 			local_buf_state = LockBufHdr(buf);
-			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
 			{
-				if (strategy != NULL)
-					AddBufferToRing(strategy, buf);
 				*buf_state = local_buf_state;
 				return buf;
 			}
+
 			UnlockBufHdr(buf, local_buf_state);
 		}
 	}
 
-	/* Nothing on the freelist, so run the "clock sweep" algorithm */
-	trycounter = NBuffers;
-	for (;;)
+	/*
+	 * Since freelist is empty, then mrulist must not be empty.
+	 */
+	Assert(StrategyControl->mruBuffer != MRUNEXT_END_OF_LIST);
+
+	int bufDesc = StrategyControl->mruBuffer;
+	while (bufDesc != MRUNEXT_END_OF_LIST)
 	{
-		buf = GetBufferDescriptor(ClockSweepTick());
+		buf = GetBufferDescriptor(bufDesc);
 
 		/*
-		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
-		 * it; decrement the usage_count (unless pinned) and keep scanning.
+		 * If the buffer is pinned, we cannot use it; keep scanning.
 		 */
 		local_buf_state = LockBufHdr(buf);
 
 		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
 		{
-			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
-			{
-				local_buf_state -= BUF_USAGECOUNT_ONE;
-
-				trycounter = NBuffers;
-			}
-			else
-			{
-				/* Found a usable buffer */
-				if (strategy != NULL)
-					AddBufferToRing(strategy, buf);
-				*buf_state = local_buf_state;
-				return buf;
-			}
-		}
-		else if (--trycounter == 0)
-		{
 			/*
-			 * We've scanned all the buffers without making any state changes,
-			 * so all the buffers are pinned (or were when we looked at them).
-			 * We could hope that someone will free one eventually, but it's
-			 * probably better to fail than to risk getting stuck in an
-			 * infinite loop.
+			 * Remove buf from mrulist.
 			 */
-			UnlockBufHdr(buf, local_buf_state);
-			elog(ERROR, "no unpinned buffers available");
+			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+			MRUListDelete(buf);
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+
+			/* Found a usable buffer */
+			*buf_state = local_buf_state;
+			return buf;
 		}
+
 		UnlockBufHdr(buf, local_buf_state);
+		bufDesc = buf->mruNext;
 	}
+
+	/*
+	 * We've scanned all the buffers without making any state changes,
+	 * so all the buffers are pinned (or were when we looked at them).
+	 * We could hope that someone will free one eventually, but it's
+	 * probably better to fail than to risk getting stuck in an
+	 * infinite loop.
+	 */
+	UnlockBufHdr(buf, local_buf_state);
+	elog(ERROR, "no unpinned buffers available");
 }
 
 /*
@@ -520,6 +545,8 @@ StrategyInitialize(bool init)
 
 		/* No pending notification */
 		StrategyControl->bgwprocno = -1;
+
+		StrategyControl->mruBuffer = MRUNEXT_END_OF_LIST;
 	}
 	else
 		Assert(!init);

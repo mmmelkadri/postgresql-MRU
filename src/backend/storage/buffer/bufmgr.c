@@ -2720,6 +2720,8 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 		result = (pg_atomic_read_u32(&buf->state) & BM_VALID) != 0;
 	}
 
+	setNewMruBuffer(buf);
+
 	ref->refcount++;
 	Assert(ref->refcount > 0);
 	ResourceOwnerRememberBuffer(CurrentResourceOwner, b);
@@ -2778,6 +2780,8 @@ PinBuffer_Locked(BufferDesc *buf)
 	UnlockBufHdr(buf, buf_state);
 
 	b = BufferDescriptorGetBuffer(buf);
+
+	setNewMruBuffer(buf);
 
 	ref = NewPrivateRefCountEntry(b);
 	ref->refcount++;
@@ -3494,11 +3498,11 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	 */
 	buf_state = LockBufHdr(bufHdr);
 
-	if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 &&
-		BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
+	if (BUF_STATE_GET_REFCOUNT(buf_state) == 0)
 	{
 		result |= BUF_REUSABLE;
 	}
+
 	else if (skip_recently_used)
 	{
 		/* Caller told us not to write recently-used buffers */
